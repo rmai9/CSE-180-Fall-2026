@@ -50,7 +50,7 @@ vnc:
 
 bash:
 	cd .. && \
-	docker run -it --rm \
+	docker run -it \
 	--net=host \
 	--privileged \
 	-v "$(CURRENT_DIR)/..":/${WORKSPACE}:Z \
