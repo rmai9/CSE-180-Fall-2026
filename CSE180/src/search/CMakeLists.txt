@@ -12,6 +12,9 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 # MRTP course package. Its installed CMake config exports the static library
 # libnavigator.a as the imported target navigation::navigator
@@ -22,6 +25,9 @@ add_executable(search src/search.cpp)
 
 ament_target_dependencies(search
   rclcpp
+  geometry_msgs
+  tf2
+  tf2_ros
 )
 
 # Link the course Navigator through its exported target, not by path.

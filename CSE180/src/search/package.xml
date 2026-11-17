@@ -9,10 +9,14 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <!-- Only what the stage 2 skeleton uses. sensor_msgs, cv_bridge / vision_msgs,
-       tf2, tf2_ros, tf2_geometry_msgs and nav_msgs are added in the stage that
-       actually uses them. -->
+  <!-- Only what the code uses so far: rclcpp, the course navigation package,
+       geometry_msgs (map-frame poses) and tf2/tf2_ros (map <- base_link).
+       sensor_msgs, vision_msgs and nav_msgs are added in the stage that uses
+       them. -->
   <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
   <depend>navigation</depend>
 
   <test_depend>ament_lint_auto</test_depend>

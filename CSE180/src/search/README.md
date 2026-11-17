@@ -3,48 +3,70 @@
 Package that will make the TurtleBot4 search the warehouse map for people, report where
 they are, and drive back home.
 
-**Status: stage 2 — package skeleton only.** There is no detector ROS package yet, and no
-navigation behaviour. This README is the project's development record: it carries forward
-the verified environment facts, the runtime interfaces, and the external detector
-experiment, so later stages do not have to rediscover them.
+**Status: stage 3 — navigation-only search state machine.** The robot drives two map-frame
+viewpoints, spins once at each, and drives back to the pose it saved at startup, with
+per-goal deadlines and cancellation. There is still no perception and no detector ROS
+package. This README is the project's development record: it carries forward the verified
+environment facts, the runtime interfaces and the external detector experiment, so later
+stages do not have to rediscover them.
 
 ---
 
 ## A. Current implementation status
 
-### What this skeleton actually does
+### What the package does now
 
 `src/search.cpp`:
 
-1. initialises rclcpp and creates one node named `search`;
-2. constructs the course `Navigator` (`Navigator navigator(true, false)`), linking against
-   the MRTP package's exported `navigation::navigator` target;
-3. logs that both steps succeeded, then `rclcpp::spin(node)` until shutdown;
-4. on SIGINT, logs `shutdown requested, exiting` and returns 0.
+1. creates the node `search`, a TF buffer/listener for `map ← base_link` and the course
+   `Navigator`, linked through the exported `navigation::navigator` target;
+2. waits at most 60 s for `/amcl/get_state` and `/bt_navigator/get_state` to appear, so a
+   stack that is not running is reported instead of hanging in the library's unbounded wait;
+3. reads the start pose from TF, logs it, and saves it as the **home pose**;
+4. calls `SetInitialPose(home)` and then `WaitUntilNav2Active()`;
+5. runs the state machine `SEND_GOAL → WAIT_GOAL → SEND_SPIN → WAIT_SPIN →` (next waypoint,
+   or) `SEND_HOME → WAIT_HOME → DONE`, one Nav2 goal per transition;
+6. gives every goal a deadline, `30 s + 3 × distance / 0.25 m/s` clamped to 120–600 s, and
+   cancels it with `CancelTask()` on expiry, reporting `deadline expired` separately from
+   `aborted by Nav2`, `canceled` and an unknown result code;
+7. logs a summary line and exits.
 
-That is all. It does not set an initial pose, send goals, subscribe to anything, look up a
-transform, or process depth.
+The waypoints are a two-entry table in the map frame (`WAYPOINTS` in `search.cpp`); the home
+pose is wherever the robot was when the node started. A failed waypoint is counted and the
+search continues with the next one; a failed return home is reported as such.
 
-### What has been tested
+### What has been tested (simulation running)
+
+Three runs in the `tb4_warehouse` simulation. Each started with the robot teleported to the
+launch pose (2.12, −21.30, yaw 1.57) and AMCL re-seeded, checked against Gazebo and TF before
+the node started. All durations are wall-clock times taken from the run's log.
+
+| Run | What it tested | Result |
+|---|---|---|
+| 1 — first attempt | startup, goal handling, deadline plumbing | **fails as a validation, bug found**: home pose saved as (0, 0, 0); all three goals reported `aborted by Nav2` after 0.9 s / 18.1 s / 0.6 s, with `controller_server: Resulting plan has 0 poses in it`; the robot drove ~6 m from spawn. See section E for the cause and the fix. |
+| 2 — initial pose set | the full cycle, with the old deadline formula | **partial**: waypoint 1 reached in 53 s (0.04 m from it), spin done; waypoint 2 cancelled by its 138 s deadline after a ~48 m detour, 3.7 m short of the goal; home cancelled by its 189 s deadline, 16 m short; summary `1/2 waypoints reached, 1 failed`. This run is the evidence for the cancel path (section C). It also exposed that the pose was not refreshed after a failed goal: the home distance was printed as 23.9 m when the straight line was 35.6 m. |
+| 3 — both fixes | the full cycle | **pass**: waypoint 1 in 57.4 s (0.10 m from the requested pose), spin 1.9 s, waypoint 2 in 140.7 s (0.05 m), spin 1.7 s, home in 184.2 s (0.13 m), total 386 s; summary `2/2 waypoints reached, 0 failed, 2 spin(s) done, home reached`, then `search finished, exiting`. |
 
 | Check | Command | Result |
 |---|---|---|
-| Build (compile + link) | `colcon build --packages-select search` in `/MRTP/CSE180` | **pass**, `Finished <<< search [9.80s]`, exit 0, no warnings |
-| Executable starts | `./install/search/lib/search/search --ros-args -p use_sim_time:=true` | **pass**; logs "search skeleton…", "Created instance of Navigator", "Navigator constructed…" |
-| Clean shutdown | `kill -INT <pid>` after 4 s | **pass**; logs `signal_handler(SIGINT/SIGTERM)` then `shutdown requested, exiting`, exit code **0** |
-| `ros2 run` entry point | `ros2 run search search --ros-args -p use_sim_time:=true` | **pass**; the same binary starts through `ros2 run` |
+| Build (compile + link) | `colcon build --packages-select search` in `/MRTP/CSE180` | **pass**, `Finished <<< search [26.0s]`, exit 0, no warnings |
+| Package entry point | `ros2 run search search --ros-args -p use_sim_time:=true` | **pass**, this is how runs 1–3 were started |
+| Bounded Nav2 gate (60 s) | covered by every run | **pass** only in the positive case: services were seen after 1.4–2.2 s. The timeout/error branch was not exercised. |
+| Ctrl+C during a goal | — | **not tested** in stage 3. Cancelling a goal that is still running on shutdown would come from the Navigator destructor. |
+| Process exit code | — | **not captured**: runs were started detached, so the log ends with `search finished, exiting` but the process status was not collected. |
 
-Simulation was **not** running during these tests (no `gz sim` / Nav2 processes; the stage
-did not need it). Therefore this proves only that the package builds, that
-`navigation::navigator` links and constructs, that the `use_sim_time` argument is accepted,
-and that the process starts and stops cleanly. It proves nothing about navigation,
-perception, TF, or the state machine.
+What this establishes: map-frame goals are executed and reported, `Spin` works, the home pose
+is saved and returned to, and a deadline that expires cancels the goal and is reported
+distinctly. What it does not establish: anything about perception, person reporting, or
+repeated/reliable behaviour — each run happened once, in one fixed scene, with two
+hand-picked viewpoints.
 
 ### What remains unimplemented
 
-Map-frame goals and `Spin`/`Backup`; the search state machine; RGB/depth subscriptions;
-depth buffering and back-projection; person association/merging; `MarkerArray` output;
-the detector node and detector integration; failure/timeout reporting; the return-home goal.
+RGB/depth subscriptions and depth buffering; back-projection and TF localisation of a
+detection; person detection, association and merging; `MarkerArray` output; the detector
+node; map-derived viewpoints (reachability, 71.6° field of view, overlapping views); a
+parameter- or file-driven waypoint list; observing while the robot is moving.
 
 ---
 
@@ -60,6 +82,7 @@ the detector node and detector integration; failure/timeout reporting; the retur
 | MRTP workspace | `/MRTP/MRTP/src/{examples,gazeboenvs,multipletopics,navigation,talklisten}` → install `/MRTP/MRTP/install` |
 | `navigation` package | present **only** in `/MRTP/MRTP/install`; `ros2 pkg prefix navigation` → `/MRTP/MRTP/install/navigation`; library `lib/libnavigator.a`; exported imported target **`navigation::navigator`** (`share/navigation/cmake/navigatorlibExport.cmake: add_library(navigation::navigator STATIC IMPORTED)`) |
 | Stale tree (warning only, untouched) | `/MRTP/{build,install,log}` at the repo root is a broken partial install (only `first` and `gazeboenvs`, no ament index). Sourcing it registers nothing; do not use it, and it was not modified. |
+| Nav2 configuration used | `MRTP/src/gazeboenvs/params/nav2_params_wh_tb4.yaml`, launched by `MRTP/src/gazeboenvs/launch/tb4_warehouse.launch.py`: `amcl.set_initial_pose: true` with `initial_pose` = spawn (2.12, −21.3, yaw 1.57), and DWB's progress checker at `required_movement_radius: 0.5` m, `movement_time_allowance: 10.0` s |
 
 ### Sourcing and build workflow (verified)
 
@@ -189,6 +212,38 @@ deadline + `CancelTask()` and distinguish `ABORTED` from `CANCELED`.
 servers include `/navigate_to_pose`, `/navigate_through_poses`, `/spin`, `/backup`,
 `/follow_path`, `/follow_waypoints`, `/compute_path_to_pose`, `/smooth_path`, `/wait`,
 `/assisted_teleop`, `/drive_on_heading` (plus route/dock).
+
+### Navigator behaviour observed in stage 3 (measured)
+
+* **The stored initial pose defaults to all zeros, and `WaitUntilNav2Active()` publishes it.**
+  `wait_for_initial_pose()` calls `set_initial_pose()` unconditionally, so unless
+  `SetInitialPose()` was called first it publishes pose (0, 0, 0, yaw 0) in `map`. In run 1
+  AMCL accepted it: `/amcl_pose` then reported (0, 0, 0), every DWB plan came back empty
+  (`Resulting plan has 0 poses in it`) and all three goals aborted. Calling
+  `SetInitialPose(home)` first turns that republish into a repetition of the true pose.
+  The causal step (AMCL accepting that message) is inferred from the observed (0, 0, 0) home
+  pose and the AMCL warnings below, not from instrumenting AMCL.
+* **`/amcl_pose` is not periodic.** `ros2 topic hz /amcl_pose` printed "does not appear to be
+  published yet" while the robot stood still after a run, and `--once` returned the update
+  from minutes earlier. AMCL publishes it when it handles an initial pose or updates its
+  filter, not on a timer, so a consumer that needs the pose continuously must use TF.
+* **`map ← base_link` is continuous.** `tf2_echo map base_link` tracked the robot through all
+  three runs; it is `map → odom` (AMCL, 10 Hz) composed with `odom → base_link`.
+* **`set_initial_pose()` stamps `now + 1 s`**, and AMCL logged
+  `Failed to transform initial pose in time (Lookup would require extrapolation into the
+  future …)` for those messages in runs 2 and 3: the library's republish is often *ignored*.
+  Harmless here, because it repeated the pose AMCL already had.
+* **A successful goal is logged at ERROR severity** by `print_result_diagnostic()` when debug
+  is on, so `search` constructs `Navigator(false, false)` and reports results itself.
+* **`CancelTask()` works as documented.** Run 2's two deadline cancels produced
+  `[bt_navigator]: Client requested to cancel the goal. Cancelling.` → `Goal canceled` →
+  `[controller_server]: Cancellation was successful. Stopping the robot.`, and `search`
+  reported `deadline expired`, not `canceled`.
+* **`Spin(1.57)` does rotate, but the yaw read immediately afterwards lags.** A separate
+  `ros2 action send_goal /spin` test sampled with `tf2_echo` after the robot settled moved the
+  heading 1.740 → 3.399 rad (+1.66 rad) and returned `SUCCEEDED`. In run 3 the yaw printed
+  right after each spin (−1.88 from a −1.57 goal, 0.94 from a 1.36 goal) had not caught up
+  with the rotation yet, so treat that number as approximate.
 
 ### Map, localization, people
 
@@ -418,9 +473,72 @@ Claims that still need tests: repeated frames per condition (success rate over N
 several viewpoints per person; an occluded person; two people in one frame; added people;
 a driving robot; and re-measuring any of this on the final integrated system.
 
+### Stage-3 limitations and corrections
+
+* **Deadlines are wall-clock, not sim time.** The stage-2 plan said "sim-time deadlines".
+  Wall clock was chosen instead: simulation time is 0 before the first `/clock` and can pause
+  or run slower than real time, and a deadline that never advances is a hang. The cost is
+  that 300 s of deadline is 300 s of wall clock, which is more robot time when the real-time
+  factor is below 1.
+* **The deadline is a backstop, not the stuck detector.** Nav2's progress checker already
+  aborts a goal that stops moving (0.5 m in 10 s, from the params file above); the deadline
+  covers a result that never arrives.
+* **Distances are straight-line and paths here are up to three times longer.** 16.2 m straight
+  needed ~48 m of driving (run 2); the original `distance / 0.15 m/s` formula therefore
+  cancelled a goal 3.7 m from arriving. The formula is now `30 s + 3 × distance / 0.25 m/s`,
+  and run 3's legs finished at 18 %, 63 % and 40 % of their deadlines. Those margins are one
+  run each, not a distribution.
+* **Run 1 proves nothing about the map, localisation quality or Nav2 tuning** beyond "supply
+  an initial pose before activating the stack".
+* **The distance for each deadline is read from TF at the moment the goal is sent.** The TF
+  buffer is only refreshed while `search` spins itself, and a Navigator call spins only its
+  own node, so the code refreshes the pose at the start of `SEND_GOAL` and `SEND_HOME` rather
+  than trusting the pose left over from the previous state (run 2's 23.9 m home distance was
+  exactly that mistake).
+* **The waypoints are hand-picked**, two of them, checked free in the static map (no occupied
+  or unknown cell within 3 m of W1, 2.10 m of W2, 2.88 m of home). That check used the map
+  file, not the live costmap, and the viewpoints are not derived from coverage requirements.
+* **`gz model -m turtlebot4 -p` is not a dependable oracle here**: it returned nothing
+  intermittently while the simulation was loading the CPU, so ground-truth checks also used
+  `tf2_echo` and `/amcl_pose`.
+
 ---
 
 ## F. Reproducibility and evidence
+
+### Stage 3 run (the numbers in section A)
+
+```bash
+# in the container, from /MRTP
+source /opt/ros/jazzy/setup.bash && source MRTP/install/setup.bash
+ros2 launch gazeboenvs tb4_warehouse.launch.py headless:=True > /tmp/stage3_sim.log 2>&1 &
+
+cd CSE180 && source /opt/ros/jazzy/setup.bash && source install/setup.bash
+colcon build --packages-select search
+
+# only needed after a previous run: put the robot at the launch pose, re-seed AMCL
+gz service -s /world/warehouse/set_pose --reqtype gz.msgs.Pose --reptype gz.msgs.Boolean \
+  --req 'name: "turtlebot4", position: {x: 2.12, y: -21.3, z: 0.01},
+         orientation: {x: 0, y: 0, z: 0.7071068, w: 0.7071068}'
+ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
+  "{header: {frame_id: map}, pose: {pose: {position: {x: 2.12, y: -21.3, z: 0.0},
+   orientation: {z: 0.7071068, w: 0.7071068}}}}"
+# before starting, gz model -m turtlebot4 -p, tf2_echo map base_link and
+# ros2 topic echo /amcl_pose --once must all read (2.120, -21.300, yaw 1.571)
+
+ros2 run search search --ros-args -p use_sim_time:=true > /tmp/stage3_run.log 2>&1 &
+```
+
+Waypoint check against the static map
+(`/opt/ros/jazzy/share/nav2_bringup/maps/warehouse.pgm`, 0.03 m/cell, origin (−15.1, −25)):
+W1 (1.00, 2.50) free with no occupied or unknown cell within 3 m, W2 (−12.83, 11.09) free with
+2.10 m, home (2.12, −21.30) free with 2.88 m. The same script confirmed the row indexing is
+as expected: person 1 at (1, −1) is an occupied cell of the map itself, person 2 at (−12, 15)
+is free with an occupied cell 0.12 m away.
+
+**Evidence that is gone.** The run logs and the simulation log lived in the container's `/tmp`
+(`stage3_sim.log`, `stage3_run.log`, `stage3_run2.log`, `stage3_run3.log`) and are not
+committed; the tables in section A quote them. Nothing in this stage is a git commit.
 
 * Experiment scripts are preserved verbatim in
   [`docs/experiments/`](docs/experiments/README.md), with their assumptions and their
@@ -439,18 +557,18 @@ a driving robot; and re-measuring any of this on the final integrated system.
 
 ## G. Next steps
 
-1. **Stage 3 — search state machine, navigation only.** `WAIT_READY → SEND_WAYPOINT →
-   WAIT_WAYPOINT → START_LOOK → WAIT_LOOK → SEND_HOME → WAIT_HOME → DONE`, with the home
-   pose saved in `map`, sim-time deadlines, `CancelTask()` on expiry, and explicit
-   `ABORTED`/`CANCELED` handling. This validates the highest-risk interface (blocking
-   Navigator calls, executor arrangement, `use_sim_time`) before any perception exists.
+1. **Stage 3 — done** (this stage): the navigation-only state machine, two map-frame
+   viewpoints, `Spin`, saved home pose, wall-clock deadlines with `CancelTask()`. Open items
+   left for later: the bounded gate's timeout branch and Ctrl+C during a running goal were not
+   exercised.
 2. **Stage 4 — detector ROS package** (`ament_python`) publishing `Detection2DArray` from
    the latest frame at ~2 Hz, header copied from the source image, empty array when nothing
    is found. Requires the `detector` package, which does not exist yet.
-3. **Stage 5 — stationary depth + TF2 localisation.** Subscribe detections, depth and
-   `CameraInfo`; back-project with `K`; transform to `map` with a bounded lookup; print the
-   estimate against person 1's known world coordinates and check the ~0.5 m target while
-   stationary and while spinning.
+3. **Stage 5 — stationary depth localisation.** Subscribe detections, depth and `CameraInfo`;
+   back-project with `K`; transform to `map` with a bounded lookup at the image stamp (the TF
+   buffer and the map-frame pose plumbing already exist in this stage); print the estimate
+   against person 1's known world coordinates and check the ~0.5 m target while stationary and
+   after a `Spin`.
 4. **Stage 6 — merging and markers.** 0.6 m association, running average, distinct
    observation counting, tentative vs confirmed, `MarkerArray`.
 5. **Stage 7 — integration**, perception live during navigation, return home, final report.
@@ -464,54 +582,67 @@ a driving robot; and re-measuring any of this on the final integrated system.
 
 ### Reused in this stage
 
+Paths are relative to the `CSE180` workspace root or to the course repository root, as named.
+
 | Kind | Source | Name / block | What it does | Why appropriate | Changes |
 |---|---|---|---|---|---|
-| Library call, used directly | `MRTP/src/navigation/` (package `navigation`, installed at `/MRTP/MRTP/install/navigation`) | `Navigator::Navigator(bool debug, bool verbose)` from `include/navigation/navigation.hpp` / `src/navigation.cpp` | Creates the rclcpp node `navigator` with all Nav2 action clients, services, `/initialpose` publisher and `/amcl_pose` subscription. | It is the course-provided navigation library; calling it instead of writing action-client plumbing is exactly the intended reuse. | None. Constructed with `(true, false)` only so the library's own log line proves it ran. |
+| Library calls, used directly | `MRTP/src/navigation/` (package `navigation`, installed at `/MRTP/MRTP/install/navigation`) | `Navigator::SetInitialPose`, `WaitUntilNav2Active`, `GoToPose`, `Spin`, `IsTaskComplete`, `GetResult`, `CancelTask` (`include/navigation/navigation.hpp`, `src/navigation.cpp`) | Publishes the initial pose, waits for AMCL and bt_navigator to be active, sends `NavigateToPose` and `Spin` goals in `map`, polls the result and cancels the running goal. | Course-provided library; calling it instead of writing action-client plumbing is the intended reuse, and this stage exists to prove the calls work. | The calls are unchanged. They are wrapped by `wait_for_task()` (deadline + cancel) and preceded by a bounded lifecycle-service check, because the library's waits have no timeout. Constructed `Navigator(false, false)` — see section C. |
+| Function, adapted | `CSE180/src/scout/src/scout.cpp` | `main()`: `tf_buffer = make_shared<tf2_ros::Buffer>(node->get_clock())`, `make_shared<tf2_ros::TransformListener>(*tf_buffer, node, true)` | TF buffer and listener for map-frame lookups. | Same requirement: read the robot pose in `map` while other work continues. | Listener built with `spin_thread = false` (the lab passes `true`): `search` spins its own node by hand, and a dedicated listener thread would put that node into a second executor. |
+| Function, adapted | `scout.cpp` | `report_tf_recovery()` and the `catch (const tf2::TransformException &)` block of `timer_callback()` | Warns once when a TF lookup fails, logs recovery. | Detection cannot be localised without TF, and the "warn once, do not flood the log" behaviour is right here too. | No `/cmd_vel` consequence: a failed lookup leaves the last known pose unchanged. Wrapped in `refresh_robot_pose()`. |
+| Function, adapted | `CSE180/src/patrol/src/patrol.cpp` | `odom_callback()`: quaternion → yaw, `atan2(2(qw·qz + qx·qy), 1 − 2(qy² + qz²))` | Robot yaw from its orientation quaternion. | Same conversion, already used and checked in this course. | Becomes the free function `yaw_of(Quaternion)`, also used to log the home heading. |
+| Structural pattern | `scout.cpp` | `enum Phase { DETECT, APPROACH, RETURN, DONE }` and the `switch` in `timer_callback()` | An explicit, readable state machine. | Hands the project the simple style it asks for: named states, one action per transition. | States are the search sequence with separate send/wait states; transitions depend on `GetResult()` and a deadline instead of a timer tick. |
+| Structural pattern | `patrol.cpp` | `waypoint_s_x[]`/`waypoint_s_y[]`, `waypoint_index`, "Reached W%d / Heading to W%d" logging, one-way advance | Waypoint table and index bookkeeping. | The state machine needs the same "one waypoint per completion, never cycle" accounting. | Waypoints are map-frame `{x, y, yaw, name}` entries sent with `GoToPose`; no `% 4` cycling, no `D_STOP` scan test, no `/cmd_vel`. |
+| Idea, adapted | `scout.cpp` | `home_odom` saved when the target is found, `RETURN` phase | Remember where the robot started and go back. | The final leg of the search is exactly this. | Saved *before* anything moves, as a full map-frame pose with orientation read from `lookupTransform(map, base_link)`, restored with `Navigator::GoToPose`. |
 
-That is the **only** reuse of executable code in this stage. No function from
-`scout.cpp`, `patrol.cpp`, `gotogoal.cpp` or `whatever.cpp` was copied into `search.cpp`.
+No function body was copied verbatim from the labs: the adapted entries above are
+re-implemented for map-frame poses and for the Navigator, and each is marked in the source.
+What `search` adds is the deadline/cancel handling, the bounded readiness gate and the
+map-frame waypoint plan, none of which exists in the labs.
 
 ### Structural patterns followed (not code reuse)
 
 | Pattern | Where it comes from | Note |
 |---|---|---|
-| `cmake_minimum_required` / `project` / `CMAKE_CXX_STANDARD 17` / `-Wall -Wextra -Wpedantic` / `find_package(ament_cmake …)` / `add_executable` / `ament_target_dependencies` / `install(TARGETS … DESTINATION lib/${PROJECT_NAME})` / `ament_package()` | Standard ament_cmake boilerplate; the same shape as `CSE180/src/scout/CMakeLists.txt` and `CSE180/src/patrol/CMakeLists.txt` | This is ROS boilerplate, **not** code that originated in the labs. The only additions are `find_package(navigation REQUIRED)` and `target_link_libraries(search navigation::navigator)`. |
-| `package.xml` format 3 with `ament_cmake` buildtool, `rclcpp` dependency, `ament_lint_auto`/`ament_lint_common` test deps, the same maintainer/license placeholders | Same files | Again boilerplate, kept identical so the four lab packages and `search` stay consistent. |
-| One node created in `main()`, then `rclcpp::spin(node)` and `rclcpp::shutdown()`; free functions rather than a node subclass | `gotogoal.cpp`, `patrol.cpp`, `scout.cpp` share this shape | Deliberate style choice: no custom node class, no extra abstraction. Only the rclcpp idiom is shared. |
+| `cmake_minimum_required` / `project` / `CMAKE_CXX_STANDARD 17` / `-Wall -Wextra -Wpedantic` / `find_package(ament_cmake …)` / `add_executable` / `ament_target_dependencies` / `install(TARGETS … DESTINATION lib/${PROJECT_NAME})` / `ament_package()` | Standard ament_cmake boilerplate; the same shape as `CSE180/src/scout/CMakeLists.txt` and `CSE180/src/patrol/CMakeLists.txt` | This is ROS boilerplate, **not** code that originated in the labs. Additions: `find_package(navigation REQUIRED)` with `target_link_libraries(search navigation::navigator)`, and `geometry_msgs`/`tf2`/`tf2_ros` as dependencies. |
+| `package.xml` format 3 with `ament_cmake` buildtool, `ament_lint_auto`/`ament_lint_common` test deps, the same maintainer/license placeholders | Same files | Again boilerplate, kept identical so the four lab packages and `search` stay consistent. The dependency list itself is not boilerplate: it contains only `rclcpp`, `geometry_msgs`, `tf2`, `tf2_ros` and `navigation`, i.e. what the code above actually uses. |
+| One node created in `main()`, free functions rather than a node subclass | `gotogoal.cpp`, `patrol.cpp`, `scout.cpp` share this shape | Deliberate style choice: no custom node class, no extra abstraction. In this stage `main()` also owns the `Navigator` and the TF listener, and the state-machine loop replaces `rclcpp::spin(node)`. |
 | `ament_cmake_copyright_FOUND` / `ament_cmake_cpplint_FOUND` set in `BUILD_TESTING` | `safedrive/CMakeLists.txt`, `gotogoal/CMakeLists.txt` | Prevent lint failures for a package that has no copyright header and is not a git repo of its own. |
 
 ### Planned reuse for later stages (not implemented yet)
 
 | Kind | Source | Name / block | What it does | Planned change | Why |
 |---|---|---|---|---|---|
-| Setup block, reused unchanged | `CSE180/src/scout/src/scout.cpp` | `main()`: `tf_buffer = make_shared<tf2_ros::Buffer>(node->get_clock())`, `tf_listener = make_shared<tf2_ros::TransformListener>(*tf_buffer, node, true)` | TF buffer + listener with its own thread. | None expected; only `map` … `optical_frame` frames will be queried. | Same requirement: transform image-frame points into `map` while the executor keeps running. |
-| Adapted function | `scout.cpp` | `report_tf_recovery()` + the `catch (const tf2::TransformException &)` block in `timer_callback()` | Logs a TF failure once, stops publishing motion, reports recovery. | No `/cmd_vel` at all in `search`; instead of stopping wheels it will skip the observation and keep its own failure counter. | Detection cannot be localised without TF; the "warn once, don't flood the log" behaviour is still right. |
-| Adapted block | `scout.cpp` | `scan_callback()` (store newest scan only) and the `tf2::doTransform(PointStamped, …)` usage | Latest-sample storage and point transformation. | Input becomes `Detection2DArray` + depth + `CameraInfo`; the transform is applied to a back-projected point instead of a laser point. | The "callback stores, timer/state machine computes" split is what keeps perception off the Navigator's spins. |
-| Structural pattern | `patrol.cpp` | `waypoint_odom_x/y[]`, `waypoint_index`, "Reached W%d / Heading to W%d" logging, one-way advance | Waypoint table and index bookkeeping. | Waypoints will be map-frame `PoseStamped`s sent with `Navigator::GoToPose`; no `% 4` cycling; no `D_STOP` scan check; no `/cmd_vel`. | The state machine needs the same "advance one waypoint per task completion" bookkeeping, nothing more. |
-| Structural pattern | `scout.cpp` | `enum Phase { DETECT, APPROACH, RETURN, DONE }` and the free-function `timer_callback()` switch | Explicit, readable state machine. | States become the search sequence (`WAIT_READY`, `SEND_WAYPOINT`, …); transitions also depend on `GetResult()` and deadlines. | Matches the simple style of the labs, which is what the project asks for. |
-| Idea, adapted | `scout.cpp` | `home_odom` saved on detection, `RETURN` phase | Remember where the robot started and go back. | Stored as a full map-frame pose **with orientation** from `lookupTransform("map", "base_link")`, restored with `Navigator::GoToPose`. | Nav2 needs a pose, not a point, and the map frame is the frame goals use. |
+| Adapted block | `CSE180/src/scout/src/scout.cpp` | `scan_callback()` (store the newest sample only) and `tf2::doTransform(PointStamped, …)` | Latest-sample storage and point transformation. | Input becomes `Detection2DArray` + depth + `CameraInfo`, and the transform is applied to a back-projected point at the image stamp instead of a laser point. | The "callback stores, state machine computes" split is what keeps perception off the Navigator's spins. |
+| Idea only | `scout.cpp` | `D_PARK` stopping distance, `closest_distance` search loop | Stop at a fixed distance from the target. | Not planned for reuse: `search` has no reason to approach a person in stage 5–7; it observes from the viewpoint. | Prevents copying steering logic the project does not need. |
+| None (new work) | — | — | — | Depth ring buffer keyed by stamp, back-projection, person association/merging, `MarkerArray`, `vision_msgs` plumbing, the detector node. | No lab contains anything equivalent. |
 
 ### New code that the project genuinely needs
 
-Depth ring buffer keyed by stamp (exact-match then tolerance), person observation
-estimation and merging (0.6 m association, running average, distinct-observation counting),
-`MarkerArray` publication, `vision_msgs` plumbing, the concrete search state machine with
-its deadline/cancel logic, and the detector node. None of the labs contains anything
-equivalent, so this will be written for `search` — and only in the stage that needs it.
+Written in this stage: the search state machine with its send/wait states, the deadline and
+cancel handling (`wait_for_task`), the bounded Nav2 readiness gate, the map-frame waypoint
+table, pose refresh from TF, and the summary accounting. None of it comes from the labs.
+
+Still to write, each only in the stage that needs it: depth ring buffer keyed by stamp
+(exact-match then tolerance), back-projection, person observation estimation and merging
+(0.6 m association, running average, distinct-observation counting), `MarkerArray`
+publication, `vision_msgs` plumbing, and the detector node.
 
 ---
 
 ## Where the remaining functionality will go
 
-`src/search.cpp` stays deliberately empty of unused scaffolding. The placement is:
+`src/search.cpp` still holds no scaffolding for work that does not exist. The placement is:
 
-* **State machine** — replaces `rclcpp::spin(node)` in `main()`; `main()` keeps ownership of
-  the `Navigator` so its blocking calls never collide with a spinning executor.
-* **RGB / depth / `CameraInfo` subscriptions** — a second node (`search_perception` or the
-  detector's arrays), callbacks that only store the newest messages, exactly like
-  `scan_callback()` in `scout.cpp`.
+* **State machine** — `run_search()`, already in place; `main()` keeps ownership of the
+  `Navigator` so its blocking calls never collide with a spinning executor, and destroys it
+  before `rclcpp::shutdown()` so the destructor's `CancelTask()` can still spin.
+* **The observation step** — a new `START_LOOK`/`WAIT_LOOK` pair replaces the current
+  `SEND_SPIN`/`WAIT_SPIN` when perception arrives; the spin stays part of it.
+* **RGB / depth / `CameraInfo` subscriptions** — on the `search` node (or the detector's
+  arrays), callbacks that only store the newest messages, as `scan_callback()` does in
+  `scout.cpp`. They must not live on the Navigator's node.
 * **Inference** — a ~2 Hz timer in the detector node (2 Hz ≈ 500 ms budget, against the
   measured 222–318 ms for `yolo26n` at `imgsz=480`).
-* **Back-projection and TF** — inside the state machine, at the observation state, using the
-  latest `CameraInfo` and a bounded timestamped `map ← optical_frame` lookup.
+* **Back-projection** — at the observation step, using the latest `CameraInfo` and a bounded
+  timestamped `map ← optical_frame` lookup; the TF buffer itself already exists here.
 * **Merging and markers** — free functions next to `search.cpp` when stage 6 starts.
